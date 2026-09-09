@@ -2,28 +2,127 @@
  * Copyright (C) 2025 Alibaba Group Holding Limited
  * All rights reserved.
  */
-import { type AgentConfig, PageAgentCore } from '@page-agent/core'
-import { PageController, type PageControllerConfig } from '@page-agent/page-controller'
+import { type AgentConfig, type ExecutionResult, PageAgentCore } from '@page-agent/core'
+import {
+	DEFAULT_LOG_SERVER_URL,
+	PageController,
+	type PageControllerConfig,
+} from '@page-agent/page-controller'
 import { Panel, type PanelConfig } from '@page-agent/ui'
 
 export * from '@page-agent/core'
 
-export type PageAgentConfig = AgentConfig & PageControllerConfig & Omit<PanelConfig, 'language'>
+export type PageAgentConfig = AgentConfig &
+	PageControllerConfig &
+	Omit<PanelConfig, 'language'> & {
+		/**
+		 * Base URL of the local flows/log server (see `scripts/flows-server.mjs`),
+		 * used both to resolve `/run <flow>` panel commands into `.md` task files
+		 * and as the xpath log export target. When unset, falls back to
+		 * `xpathLogServerUrl`, then to `DEFAULT_LOG_SERVER_URL`.
+		 * @default 'http://127.0.0.1:8787'
+		 */
+		flowsBaseUrl?: string
+	}
 
 export class PageAgent extends PageAgentCore {
 	panel: Panel
 
+	readonly #flowsBaseUrl: string
+
 	constructor(config: PageAgentConfig) {
+		const flowsBaseUrl = (
+			config.flowsBaseUrl ??
+			config.xpathLogServerUrl ??
+			DEFAULT_LOG_SERVER_URL
+		).replace(/\/+$/, '')
+
 		const pageController = new PageController({
 			...config,
 			enableMask: config.enableMask ?? true,
+			xpathLogServerUrl: flowsBaseUrl,
 		})
 
 		super({ ...config, pageController })
+
+		this.#flowsBaseUrl = flowsBaseUrl
 
 		this.panel = new Panel(this, {
 			language: config.language,
 			promptForNextTask: config.promptForNextTask,
 		})
+	}
+
+	/**
+	 * Execute a task. When the task is a `/run <flow>` command, the flow's
+	 * `.md` file is fetched from the local flow server first and its content
+	 * becomes the task. Any other input runs as-is.
+	 *
+	 * When the task finishes, the xpath log (elements the LLM selected while
+	 * executing this task) is exported as a brand new `.txt` file — via the
+	 * local log server, or via a browser download when the server is
+	 * unreachable. Lines that could not be exported are kept for the next
+	 * successful export instead of being dropped.
+	 */
+	async execute(task: string): Promise<ExecutionResult> {
+		try {
+			return await this.#executeTask(task)
+		} finally {
+			// Export the xpaths the LLM selected during this task as a new file.
+			try {
+				await this.pageController.downloadXPathLog()
+			} catch (error) {
+				console.error('[PageAgent] Failed to export xpath log:', error)
+			}
+		}
+	}
+
+	/**
+	 * Resolve and run a single task (handles `/run <flow>` commands).
+	 *
+	 * Deterministic `/run` errors (missing flow name, unreadable flow file) are
+	 * reported through the normal agent run instead of being thrown or returned
+	 * directly: the panel surfaces run outcomes via agent status/history events,
+	 * so a direct short-circuit would leave the panel stuck in its hidden input
+	 * state and make its close button dispose the whole agent.
+	 */
+	async #executeTask(task: string): Promise<ExecutionResult> {
+		const t = task.trim()
+		if (!t.startsWith('/run')) {
+			return super.execute(task)
+		}
+
+		const flowName = t.slice('/run'.length).trim()
+		if (!flowName) {
+			return super.execute(
+				'Do not operate the page. Immediately report an error with the done tool (success=false) and end the task: the /run command is missing a flow name. Usage: /run <flow-name>'
+			)
+		}
+
+		let content: string | null = null
+		try {
+			content = await this.#loadFlowFile(flowName)
+		} catch (error) {
+			console.error('[PageAgent] Failed to load flow file:', error)
+		}
+
+		if (!content) {
+			return super.execute(
+				`Do not operate the page. Immediately report an error with the done tool (success=false) and end the task: failed to read the flow file "${flowName}.md" from the local flow server (${this.#flowsBaseUrl}). Make sure the server is running (npm run flows) and that the file exists in the flows directory.`
+			)
+		}
+
+		console.log(`[PageAgent] Running flow from file: ${flowName}.md`)
+		return super.execute(content)
+	}
+
+	/** Fetch a flow file's markdown content from the local flow server. */
+	async #loadFlowFile(name: string): Promise<string> {
+		const url = `${this.#flowsBaseUrl}/flows/${encodeURIComponent(name)}.md`
+		const response = await fetch(url)
+		if (!response.ok) {
+			throw new Error(`HTTP ${response.status} for ${url}`)
+		}
+		return (await response.text()).trim()
 	}
 }

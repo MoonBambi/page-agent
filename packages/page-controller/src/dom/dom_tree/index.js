@@ -11,7 +11,7 @@
  * @edit direct dom ref
  * @edit @workaround input.checked
  * @edit smaller zIndex for highlight
- * @edit no need for xpath
+ * @edit keep xpath for LLM selection logging/export
  * @edit add `extra` field for extra data
  * @edit scrollable element detection
  * @edit add `data-browser-use-ignore` attribute
@@ -1598,9 +1598,9 @@ export default (
 			attributes: {},
 
 			/**
-			 * @edit no need for xpath
+			 * @edit keep xpath: used to log/export the xpath of elements the LLM selects.
 			 */
-			// xpath: getXPathTree(node, true),
+			xpath: getXPathTree(node, true),
 
 			children: [],
 		}

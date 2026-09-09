@@ -29,6 +29,7 @@
         "start": "npm run dev --workspace=@page-agent/website",
         "dev:ext": "npm run dev -w @page-agent/ext",
         "dev:demo": "npm run dev:demo --workspace=page-agent",
+        "flows": "node scripts/flows-server.mjs",
         "build": "node scripts/build.js",
         "build:libs": "node scripts/build-libs.js",
         "build:website": "npm run build:website --workspace=@page-agent/website",
