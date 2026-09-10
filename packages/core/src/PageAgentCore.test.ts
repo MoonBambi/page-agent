@@ -30,7 +30,11 @@ function agentResponse(args: unknown): Response {
 	)
 }
 
-function createPageController(): PageController {
+/**
+ * Mock page controller.
+ * @param overrides - Replaces individual members, so a test owns the spy it asserts on.
+ */
+function createPageController(overrides: Partial<Record<string, unknown>> = {}): PageController {
 	const browserState: BrowserState = {
 		url: 'https://example.test/',
 		title: 'Test page',
@@ -45,7 +49,9 @@ function createPageController(): PageController {
 		cleanUpHighlights: vi.fn(),
 		getLastUpdateTime: vi.fn(() => Date.now()),
 		getBrowserState: vi.fn(async () => browserState),
+		setTaskAbortSignal: vi.fn(),
 		dispose: vi.fn(),
+		...overrides,
 	} as unknown as PageController
 }
 
@@ -149,6 +155,23 @@ describe.concurrent('PageAgentCore lifecycle', () => {
 
 			await agent.stop()
 			await result
+		})
+
+		it('attaches the task abort signal to the controller and clears it afterwards', async () => {
+			// Auxiliary work started by the controller (precise xpath generation)
+			// must be cancellable together with the task.
+			const setTaskAbortSignal = vi.fn()
+			const pageController = createPageController({ setTaskAbortSignal })
+			const fetchMock = createFetchMock().mockResolvedValueOnce(doneResponse('all done'))
+			const agent = createAgent(fetchMock, { pageController })
+
+			await agent.execute('do something')
+
+			expect(setTaskAbortSignal).toHaveBeenCalledTimes(2)
+			const attached = setTaskAbortSignal.mock.calls[0][0]
+			expect(attached).toBeInstanceOf(AbortSignal)
+			expect(attached?.aborted).toBe(true) // aborted once the task settled
+			expect(setTaskAbortSignal.mock.calls[1][0]).toBeUndefined()
 		})
 	})
 

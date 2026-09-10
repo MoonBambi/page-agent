@@ -48,6 +48,11 @@ export async function waitFor(seconds: number): Promise<void> {
 	await new Promise((resolve) => setTimeout(resolve, seconds * 1000))
 }
 
+/** Collapse every whitespace run to a single space and trim the ends. */
+export function normalizeWhitespace(text: string): string {
+	return text.replace(/\s+/g, ' ').trim()
+}
+
 // ======= mask events =======
 
 /**

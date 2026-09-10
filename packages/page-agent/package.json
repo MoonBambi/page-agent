@@ -50,6 +50,7 @@
         "build": "vite build && npm run build:demo",
         "build:demo": "vite build --config vite.iife.config.js",
         "dev:demo": "concurrently \"vite build --config vite.iife.config.js --watch\" \"npx serve dist/iife -p 5174\"",
+        "test": "vitest run",
         "prepublishOnly": "node ../../scripts/pre-publish.js",
         "postpublish": "node ../../scripts/post-publish.js"
     },

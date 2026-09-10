@@ -18,7 +18,26 @@ import * as dom from './dom'
 import type { FlatDomTree, InteractiveElementDomNode } from './dom/dom_tree/type'
 import { getPageInfo } from './dom/getPageInfo'
 import { patchReact } from './patches/react'
-import { isAnchorElement } from './utils'
+import { isAnchorElement, normalizeWhitespace } from './utils'
+import {
+	XPATH_LOG_SCHEMA_VERSION,
+	type XPathCandidateProvider,
+	type XPathLogEntry,
+	exportXPathLog,
+	fillElementDetails,
+	formatSelectedElementLine,
+	resolvePreciseXpath,
+} from './xpathLog'
+
+// The xpath log's public surface lives in ./xpathLog; re-exported so consumers
+// of this package entry point keep a single import site.
+export {
+	DEFAULT_LOG_SERVER_URL,
+	type XPathCandidateProvider,
+	type XPathLogEntry,
+	type XPathSnapshot,
+} from './xpathLog'
+export type { XPathStatus } from './xpathVerify'
 
 /**
  * Configuration for PageController
@@ -33,6 +52,27 @@ export interface PageControllerConfig extends dom.DomConfig {
 	 * browser download. Defaults to `DEFAULT_LOG_SERVER_URL`.
 	 */
 	xpathLogServerUrl?: string
+	/**
+	 * When enabled, each element the LLM selects is also logged with a precise,
+	 * attribute-based xpath (e.g. `//input[@class='x' and @placeholder='y']`).
+	 *
+	 * Candidate xpaths come from `preciseXpathProvider` (LLM-backed, injected by
+	 * the agent layer — PageController stays LLM-free) and are verified against
+	 * the live DOM: a candidate that selects exactly the selected element wins.
+	 * A candidate that uniquely selects a *different* element is a wrong answer,
+	 * and is never logged as this element's selector. When no candidate is
+	 * unambiguous, the narrowest candidate containing the element is logged with
+	 * its document-order position. Each entry records which of those happened in
+	 * `XPathLogEntry.preciseXpathStatus`; elements whose candidates are usable in
+	 * no way keep the raw structural xpath only. Default: false.
+	 */
+	enablePreciseXpath?: boolean
+	/**
+	 * Provider that turns the snapshot of a selected element into candidate
+	 * precise xpaths. Only consulted when `enablePreciseXpath` is true.
+	 * @see XPathCandidateProvider
+	 */
+	preciseXpathProvider?: XPathCandidateProvider
 }
 
 /**
@@ -53,9 +93,6 @@ interface ActionResult {
 	success: boolean
 	message: string
 }
-
-/** Default local flows/log server (see `scripts/flows-server.mjs`). */
-export const DEFAULT_LOG_SERVER_URL = 'http://127.0.0.1:8787'
 
 /**
  * PageController manages DOM state and element interactions.
@@ -81,11 +118,19 @@ export class PageController extends EventTarget {
 	private elementTextMap = new Map<number, string>()
 
 	/**
-	 * XPath log lines for the elements the LLM selected during the current task.
-	 * Each entry is printed to the console when the element is selected and
-	 * exported as a new `.txt` file when the task ends (see downloadXPathLog).
+	 * XPath log entries for the elements the LLM selected during the current
+	 * task. Each entry is printed to the console when the element is selected
+	 * and exported as JSON Lines when the task ends (see downloadXPathLog).
 	 */
-	private xpathLog: string[] = []
+	private xpathLog: XPathLogEntry[] = []
+
+	/**
+	 * Abort signal of the task currently being executed, if any. Auxiliary work
+	 * that PageController starts on its own (precise-xpath generation) is
+	 * cancelled together with the task, so the agent attaches its task signal
+	 * here. Undefined means "no task running".
+	 */
+	private taskAbortSignal?: AbortSignal
 
 	/**
 	 * Simplified HTML for LLM consumption.
@@ -111,6 +156,16 @@ export class PageController extends EventTarget {
 		patchReact(this)
 
 		if (config.enableMask) this.initMask()
+	}
+
+	/**
+	 * Attach (or clear, with `undefined`) the abort signal of the task being
+	 * executed. Auxiliary work started by PageController is cancelled by it, so
+	 * the agent attaches its task signal when a task starts and clears it once
+	 * the task has settled.
+	 */
+	setTaskAbortSignal(signal?: AbortSignal): void {
+		this.taskAbortSignal = signal
 	}
 
 	/**
@@ -257,61 +312,60 @@ export class PageController extends EventTarget {
 
 	/**
 	 * Print + buffer the xpath of the element the LLM just selected (by index).
-	 * Called before every element action so each LLM selection shows its xpath.
+	 * Called (and awaited) before every element action so each LLM selection is
+	 * logged while the element is still alive in the DOM.
 	 *
-	 * Console keeps a short line; the exported log file additionally records the
-	 * element's own details (value/checked state, text, outerHTML snippet) so the
-	 * absolute xpath can be verified and reused without the live DOM later.
+	 * When `enablePreciseXpath` is on and a `preciseXpathProvider` is injected,
+	 * the record additionally carries a selector verified against the live DOM to
+	 * select exactly this element; see `XPathStatus` for how to read the outcome.
+	 * Rendering and verification live in ./xpathLog.
 	 */
-	private logSelectedElement(
+	private async logSelectedElement(
 		action: string,
 		index: number,
 		element: HTMLElement | null,
 		extra?: string
-	): void {
-		const node = this.selectorMap.get(index)
-		const xpath = node?.xpath
+	): Promise<void> {
+		const xpath = this.selectorMap.get(index)?.xpath
 		if (!xpath) return
-		const elemText = (this.elementTextMap.get(index) ?? '').replace(/\s+/g, ' ').trim()
-		const head = `[${new Date().toLocaleTimeString()}] ${action} index=${index} xpath=${xpath}`
-		console.log(
-			`[PageController] LLM selected element -> ${head}${elemText ? ` element=${elemText.slice(0, 120)}` : ''}`
-		)
-		const detail = this.describeElement(head, element)
-		this.xpathLog.push(extra ? `${detail} ${extra}` : detail)
-	}
+		const elementText = normalizeWhitespace(this.elementTextMap.get(index) ?? '').slice(0, 120)
 
-	/**
-	 * Append the element's own details to the log line:
-	 * - `checked=` for checkboxes/radios
-	 * - `value=` for form controls that carry a non-empty value (redacted for
-	 *   password inputs, whose content is a secret)
-	 * - `text=` trimmed text content
-	 * - `html=` flattened outerHTML snippet
-	 */
-	private describeElement(head: string, element: HTMLElement | null): string {
-		if (!element) return head
-		const parts: string[] = [head]
-		const tag = element.tagName.toLowerCase()
-		const input = element as HTMLInputElement
-		const isPasswordInput = tag === 'input' && input.type === 'password'
+		const entry: XPathLogEntry = {
+			schemaVersion: XPATH_LOG_SCHEMA_VERSION,
+			time: new Date().toLocaleTimeString(),
+			action,
+			index,
+			xpath,
+			elementText: elementText || undefined,
+			...(extra ? { extra } : {}),
+		}
+		fillElementDetails(entry, element)
 
-		if (tag === 'input' && (input.type === 'checkbox' || input.type === 'radio')) {
-			parts.push(`checked=${input.checked}`)
-		} else if (isPasswordInput) {
-			parts.push('value=<redacted>')
-		} else if (tag !== 'button' && typeof input.value === 'string' && input.value !== '') {
-			parts.push(`value=${input.value.replace(/\s+/g, ' ').trim().slice(0, 120)}`)
+		if (this.config.enablePreciseXpath && element && this.config.preciseXpathProvider) {
+			const verdict = await resolvePreciseXpath({
+				element,
+				xpath,
+				provider: this.config.preciseXpathProvider,
+				signal: this.taskAbortSignal,
+			})
+			entry.preciseXpath = verdict.xpath
+			entry.preciseXpathStatus = verdict.status
+			entry.preciseXpathIndex = verdict.index
+			entry.preciseXpathMatchCount = verdict.matchCount
+			entry.preciseXpathOffTarget = verdict.offTargetXpath
+			// The one verdict worth shouting about: the generator answered with a
+			// selector for a different node, so this element has no precise xpath.
+			// The offending candidate is recorded in the entry either way.
+			if (verdict.status === 'off-target') {
+				console.warn(
+					'[PageController] Discarded precise xpath candidate(s) selecting a different element ' +
+						`than the selected one (raw_xpath=${xpath}, first_off_target=${verdict.offTargetXpath})`
+				)
+			}
 		}
 
-		const text = (element.textContent ?? '').replace(/\s+/g, ' ').trim()
-		if (text) parts.push(`text=${text.slice(0, 120)}`)
-
-		let html = element.outerHTML.replace(/\s+/g, ' ').trim()
-		if (isPasswordInput) html = html.replace(/ value="[^"]*"/gi, ' value="<redacted>"')
-		if (html) parts.push(`html=${html.slice(0, 250)}`)
-
-		return parts.join(' ')
+		console.log(formatSelectedElementLine(entry))
+		this.xpathLog.push(entry)
 	}
 
 	/** Clear the buffered xpath log (e.g. before a new task starts). */
@@ -321,106 +375,27 @@ export class PageController extends EventTarget {
 
 	/**
 	 * Export the xpath log accumulated during the current task as a brand new
-	 * `.txt` file. The file is handed to the local log server first (`POST
-	 * /logs`, see `scripts/flows-server.mjs`), which writes it into the project
-	 * `logs/` dir — this works in any Chromium environment, including embedded
-	 * desktop clients that have no download UI. When the server is unreachable,
-	 * a real browser download of the `.txt` file is used as a fallback.
+	 * JSON Lines (`.jsonl`) file, one JSON object per selected element. The file
+	 * is handed to the local log server first (`POST /logs`, see
+	 * `scripts/flows-server.mjs`), which writes it into the project `logs/` dir —
+	 * this works in any Chromium environment, including embedded desktop clients
+	 * that have no download UI. When the server is unreachable, a real browser
+	 * download of the file is used as a fallback.
 	 *
-	 * The buffered lines are only cleared once an export has succeeded, so a
-	 * failed export keeps its lines for a later retry instead of dropping them.
-	 * @returns Number of lines handed to a successful export; 0 when there is
+	 * The buffered entries are only cleared once an export has succeeded, so a
+	 * failed export keeps them for a later retry instead of dropping them.
+	 * @returns Number of entries handed to a successful export; 0 when there is
 	 * nothing to export or nothing could be persisted.
 	 */
-	async downloadXPathLog(filename = `page-agent-xpath-${Date.now()}.txt`): Promise<number> {
-		if (this.xpathLog.length === 0) {
-			console.warn(
-				'[PageController] XPath log is empty — no LLM element selections were recorded for this task.'
-			)
-			return 0
-		}
-		const content = `${this.xpathLog.join('\n')}\n`
-		const count = this.xpathLog.length
-
-		const serverUrl = (this.config.xpathLogServerUrl ?? DEFAULT_LOG_SERVER_URL).replace(/\/+$/, '')
-		console.info(
-			`[PageController] Exporting ${count} xpath log line(s) to log server (${serverUrl})...`
-		)
-
-		try {
-			await this.#saveLogViaServer(serverUrl, content, filename)
-			this.xpathLog = []
-			return count
-		} catch (error) {
-			console.error(
-				`[PageController] Log server unreachable (${serverUrl}): ${
-					error instanceof Error ? error.message : error
-				}. Make sure the flows server is running: npm run flows`
-			)
-
-			if (await this.#downloadViaBrowser(filename, content)) {
-				this.xpathLog = []
-				return count
-			}
-
-			// Nothing persisted: keep the lines so a later export can retry them.
-			console.warn(
-				`[PageController] XPath log export failed — ${count} line(s) kept in memory for the next export. ` +
-					'Each selected element was already printed to the console above.'
-			)
-			return 0
-		}
-	}
-
-	/** Save the xpath log by POSTing it to the local log server (`POST /logs`). */
-	async #saveLogViaServer(serverUrl: string, content: string, filename: string): Promise<void> {
-		const base = serverUrl.replace(/\/+$/, '')
-		const response = await fetch(`${base}/logs`, {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ name: filename, content }),
+	async downloadXPathLog(filename = `page-agent-xpath-${Date.now()}.jsonl`): Promise<number> {
+		const count = await exportXPathLog({
+			entries: this.xpathLog,
+			filename,
+			serverUrl: this.config.xpathLogServerUrl,
 		})
-		if (!response.ok) throw new Error(`HTTP ${response.status}`)
-		const result = (await response.json()) as { file?: string }
-		console.info(
-			`[PageController] XPath log exported -> ${result.file ?? `${base}/logs/${filename}`}`
-		)
-	}
-
-	/**
-	 * Fallback export path: trigger a real browser download of the log file.
-	 * Used when the local log server is unreachable. Returns false when no
-	 * download API is available (e.g. Node or a sandboxed iframe).
-	 */
-	async #downloadViaBrowser(filename: string, content: string): Promise<boolean> {
-		try {
-			if (
-				typeof document === 'undefined' ||
-				typeof URL === 'undefined' ||
-				typeof Blob === 'undefined' ||
-				!URL.createObjectURL
-			) {
-				return false
-			}
-			const blob = new Blob([content], { type: 'text/plain;charset=utf-8' })
-			const url = URL.createObjectURL(blob)
-			const link = document.createElement('a')
-			link.href = url
-			link.download = filename
-			document.body.appendChild(link)
-			link.click()
-			link.remove()
-			setTimeout(() => URL.revokeObjectURL(url), 1_000)
-			console.info(`[PageController] XPath log exported via browser download -> ${filename}`)
-			return true
-		} catch (error) {
-			console.error(
-				`[PageController] Browser download of xpath log failed: ${
-					error instanceof Error ? error.message : error
-				}`
-			)
-			return false
-		}
+		// Only clear what was actually persisted, so a failed export can retry.
+		if (count > 0) this.xpathLog = []
+		return count
 	}
 
 	/**
@@ -430,7 +405,7 @@ export class PageController extends EventTarget {
 		try {
 			this.assertIndexed()
 			const element = getElementByIndex(this.selectorMap, index)
-			this.logSelectedElement('click', index, element)
+			await this.logSelectedElement('click', index, element)
 			const elemText = this.elementTextMap.get(index)
 			await clickElement(element)
 
@@ -463,7 +438,7 @@ export class PageController extends EventTarget {
 			const element = getElementByIndex(this.selectorMap, index)
 			const isPasswordInput = element instanceof HTMLInputElement && element.type === 'password'
 			const inputLog = isPasswordInput ? 'input=<redacted>' : `input=${text.slice(0, 120)}`
-			this.logSelectedElement('input_text', index, element, inputLog)
+			await this.logSelectedElement('input_text', index, element, inputLog)
 			const elemText = this.elementTextMap.get(index)
 			await inputTextElement(element, text)
 
@@ -486,7 +461,12 @@ export class PageController extends EventTarget {
 		try {
 			this.assertIndexed()
 			const element = getElementByIndex(this.selectorMap, index)
-			this.logSelectedElement('select_option', index, element, `option=${optionText.slice(0, 80)}`)
+			await this.logSelectedElement(
+				'select_option',
+				index,
+				element,
+				`option=${optionText.slice(0, 80)}`
+			)
 			const elemText = this.elementTextMap.get(index)
 			await selectOptionElement(element as HTMLSelectElement, optionText)
 
@@ -520,7 +500,7 @@ export class PageController extends EventTarget {
 
 			const element = index !== undefined ? getElementByIndex(this.selectorMap, index) : null
 
-			if (element) this.logSelectedElement('scroll', index!, element)
+			if (element) await this.logSelectedElement('scroll', index!, element)
 
 			const message = await scrollVertically(scrollAmount, element)
 
@@ -553,7 +533,7 @@ export class PageController extends EventTarget {
 
 			const element = index !== undefined ? getElementByIndex(this.selectorMap, index) : null
 
-			if (element) this.logSelectedElement('scroll_horizontally', index!, element)
+			if (element) await this.logSelectedElement('scroll_horizontally', index!, element)
 
 			const message = await scrollHorizontally(scrollAmount, element)
 

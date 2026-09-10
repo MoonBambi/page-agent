@@ -221,6 +221,9 @@ export class PageAgentCore extends EventTarget {
 		this.#states = { totalWaitTime: 0, lastURL: '', browserState: null }
 		this.#abortController = new AbortController()
 		const signal = this.#abortController.signal
+		// Let the controller cancel the auxiliary work it starts (e.g. precise
+		// xpath generation) together with this task.
+		this.pageController.setTaskAbortSignal(signal)
 
 		let resolveRunning!: () => void
 		this.#running = new Promise<void>((r) => (resolveRunning = r))
@@ -369,6 +372,7 @@ export class PageAgentCore extends EventTarget {
 			await suppress(() => this.pageController.cleanUpHighlights())
 			await suppress(() => this.pageController.hideMask())
 			this.#abortController.abort()
+			this.pageController.setTaskAbortSignal(undefined)
 			resolveRunning()
 			this.#setStatus(finalStatus)
 		}

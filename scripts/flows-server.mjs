@@ -15,7 +15,7 @@
  * Endpoints:
  *   GET  /flows                  -> JSON list of flow names (without .md)
  *   GET  /flows/<name>.md        -> raw markdown content (text/plain; charset=utf-8)
- *   POST /logs                   -> save xpath/agent logs to <repo>/logs/<name>.txt
+ *   POST /logs                   -> save xpath/agent logs to <repo>/logs/<name>.txt|.jsonl
  *
  * Note: by default the server answers with `Access-Control-Allow-Origin: *` and
  * binds to 127.0.0.1. Any website open in the user's browser can then read flow
@@ -129,7 +129,9 @@ const server = createServer(async (req, res) => {
 			// Raw text body is also accepted (content = body).
 		}
 		const safeName =
-			name && /^[\w\u4e00-\u9fff-]+\.txt$/.test(name) ? name : `page-agent-xpath-${Date.now()}.txt`
+			name && /^[\w\u4e00-\u9fff-]+\.(txt|jsonl)$/.test(name)
+				? name
+				: `page-agent-xpath-${Date.now()}.jsonl`
 		try {
 			await mkdir(logsDir, { recursive: true })
 			const filePath = join(logsDir, safeName)
@@ -191,7 +193,7 @@ server.listen(port, host, () => {
 	console.log(`  Logs dir  : ${logsDir}`)
 	console.log(`  List      : http://${host}:${port}/flows`)
 	console.log(`  File      : http://${host}:${port}/flows/<name>.md`)
-	console.log(`  Save logs : POST http://${host}:${port}/logs  {"name":"x.txt","content":"..."}`)
+	console.log(`  Save logs : POST http://${host}:${port}/logs  {"name":"x.jsonl","content":"..."}`)
 	if (allowOrigin === '*') {
 		console.warn(
 			`  ⚠ CORS is open to any origin (Access-Control-Allow-Origin: *). Any website open in your browser can read flows/ and write logs/. Set FLOWS_ALLOW_ORIGIN (e.g. http://localhost:5174) to restrict.`
