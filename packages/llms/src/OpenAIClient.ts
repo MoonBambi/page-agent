@@ -3,7 +3,7 @@
  */
 import * as z from 'zod/v4'
 
-import { InvokeError, InvokeErrorTypes } from './errors'
+import { InvokeError, type InvokeErrorType, InvokeErrorTypes } from './errors'
 import type {
 	InvokeOptions,
 	InvokeResult,
@@ -13,6 +13,32 @@ import type {
 	Tool,
 } from './types'
 import { modelPatch, zodToOpenAITool } from './utils'
+
+/**
+ * Pick the most useful message out of a non-OK response body.
+ *
+ * Providers are not consistent about where they put it, and a body that is
+ * parsed successfully but has no `error.message` must not degrade to the bare
+ * HTTP status text — that hides the actual reason from the user:
+ * - OpenAI and most gateways: `{ error: { message } }`
+ * - flat gateways/proxies (DashScope, the page-agent demo relay):
+ *   `{ error: 'Invalid request', message: '...' }` or `{ code, message }`
+ *
+ * @returns The first usable message found, else the HTTP status text.
+ */
+export function extractErrorMessage(errorData: unknown, response: Response): string {
+	const data = errorData as { error?: unknown; message?: unknown } | undefined
+	const nested =
+		typeof data?.error === 'object' && data.error !== null
+			? (data.error as { message?: unknown }).message
+			: undefined
+
+	for (const candidate of [nested, data?.message, data?.error]) {
+		if (typeof candidate === 'string' && candidate.trim()) return candidate.trim()
+	}
+
+	return response.statusText || `HTTP ${response.status}`
+}
 
 /**
  * Client for OpenAI compatible APIs
@@ -96,34 +122,29 @@ export class OpenAIClient implements LLMClient {
 			} catch (error) {
 				if ((error as any)?.name === 'AbortError') throw error
 			}
-			const errorMessage = errorData?.error?.message || response.statusText
+			const errorMessage = extractErrorMessage(errorData, response)
+
+			// Keep the status code on the error: callers that retry or fall back
+			// need to tell "the endpoint rejected this" from "the network broke".
+			const httpError = (type: InvokeErrorType, message: string): InvokeError => {
+				const error = new InvokeError(type, message, errorData)
+				error.statusCode = response.status
+				return error
+			}
 
 			if (response.status === 401 || response.status === 403) {
-				throw new InvokeError(
+				throw httpError(
 					InvokeErrorTypes.AUTH_ERROR,
-					`Authentication failed: ${errorMessage}`,
-					errorData
+					`Authentication failed (HTTP ${response.status}): ${errorMessage}`
 				)
 			}
 			if (response.status === 429) {
-				throw new InvokeError(
-					InvokeErrorTypes.RATE_LIMIT,
-					`Rate limit exceeded: ${errorMessage}`,
-					errorData
-				)
+				throw httpError(InvokeErrorTypes.RATE_LIMIT, `Rate limit exceeded: ${errorMessage}`)
 			}
 			if (response.status >= 500) {
-				throw new InvokeError(
-					InvokeErrorTypes.SERVER_ERROR,
-					`Server error: ${errorMessage}`,
-					errorData
-				)
+				throw httpError(InvokeErrorTypes.SERVER_ERROR, `Server error: ${errorMessage}`)
 			}
-			throw new InvokeError(
-				InvokeErrorTypes.UNKNOWN,
-				`HTTP ${response.status}: ${errorMessage}`,
-				errorData
-			)
+			throw httpError(InvokeErrorTypes.UNKNOWN, `HTTP ${response.status}: ${errorMessage}`)
 		}
 
 		// 4. Parse and validate response

@@ -22,7 +22,7 @@ export const InvokeErrorTypes = {
 	CONTENT_FILTER: 'content_filter', // Content filtered
 } as const
 
-type InvokeErrorType = (typeof InvokeErrorTypes)[keyof typeof InvokeErrorTypes]
+export type InvokeErrorType = (typeof InvokeErrorTypes)[keyof typeof InvokeErrorTypes]
 
 const RETRYABLE_TYPES: readonly InvokeErrorType[] = [
 	InvokeErrorTypes.NETWORK_ERROR,

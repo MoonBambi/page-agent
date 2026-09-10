@@ -212,6 +212,34 @@ describe('OpenAIClient.invoke — HTTP errors', () => {
 			message: expect.stringContaining('Internal Boom'),
 		})
 	})
+
+	it('keeps a flat proxy message instead of degrading to statusText', async () => {
+		// e.g. the page-agent demo proxy: {"error":"Invalid request","message":"..."}
+		const { client, fetchMock } = makeClient()
+		fetchMock.mockResolvedValue(
+			jsonResponse(
+				{
+					error: 'Invalid request',
+					message: 'System prompt must match the official page-agent system prompt.',
+				},
+				403
+			)
+		)
+		await expect(client.invoke([], tools, signal)).rejects.toMatchObject({
+			type: InvokeErrorTypes.AUTH_ERROR,
+			statusCode: 403,
+			message: expect.stringContaining('System prompt must match the official'),
+		})
+	})
+
+	it('uses a plain-string error field when there is no message', async () => {
+		const { client, fetchMock } = makeClient()
+		fetchMock.mockResolvedValue(jsonResponse({ error: 'Invalid request' }, 403))
+		await expect(client.invoke([], tools, signal)).rejects.toMatchObject({
+			type: InvokeErrorTypes.AUTH_ERROR,
+			message: expect.stringContaining('Invalid request'),
+		})
+	})
 })
 
 // ---------- Response anomalies ----------
