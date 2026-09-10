@@ -55,9 +55,60 @@ function blurLastClickedElement() {
 }
 
 /**
+ * Whether an element can fire a click event on its own.
+ *
+ * `click()` belongs to `HTMLElement`, not to `Element`: SVG elements — the
+ * innermost target of most icon buttons — have no such method, so calling it
+ * throws. Do not test this with `isHTMLElement` from ./utils: that helper only
+ * checks `nodeType === 1`, so it answers `true` for SVG elements as well.
+ *
+ * @private Internal method, subject to change at any time.
+ */
+function canClickItself(element: Element): element is HTMLElement {
+	return typeof (element as HTMLElement).click === 'function'
+}
+
+/**
+ * Shadow-including containment. `Node.contains` does not see into shadow roots
+ * (a host does not report containing its own shadow content), which would make
+ * every click inside a web component fall back to the host element.
+ *
+ * @private Internal method, subject to change at any time.
+ */
+function containsDeep(root: Element, node: Element): boolean {
+	if (root.contains(node)) return true
+	const shadowRoot = node.getRootNode() as ShadowRoot
+	return shadowRoot.host ? containsDeep(root, shadowRoot.host) : false
+}
+
+/**
+ * Deepest element at a viewport point, descending into open shadow roots.
+ *
+ * `Document.elementFromPoint` retargets shadow content to its host, so a click
+ * inside a web component would otherwise be dispatched at the host — the same
+ * dead click this file exists to avoid. Closed shadow roots cannot be entered
+ * and stop at the host, which is the best target available for them.
+ *
+ * @private Internal method, subject to change at any time.
+ */
+function deepestElementAt(doc: Document, x: number, y: number): Element | null {
+	let element = doc.elementFromPoint(x, y)
+	while (element?.shadowRoot) {
+		const inner = element.shadowRoot.elementFromPoint(x, y)
+		if (!inner || inner === element) break
+		element = inner
+	}
+	return element
+}
+
+/**
  * Simulate a full click following W3C Pointer Events + UI Events spec order:
  * pointerover/enter → mouseover/enter → pointerdown → mousedown → [focus] →
  * pointerup → mouseup → click
+ *
+ * Events are dispatched at the innermost element under the click point (SVG
+ * icons included), not at `element` itself, so listeners bound to inner
+ * elements fire exactly like they do for a real user click.
  *
  * @private Internal method, subject to change at any time.
  */
@@ -81,14 +132,30 @@ export async function clickElement(element: HTMLElement) {
 
 	// Hit-test to find the deepest element at click coordinates, matching
 	// real browser behavior where events target the innermost element.
+	//
+	// Events must be dispatched there rather than on `element` itself: `element`
+	// is usually an outer wrapper (whatever element the index resolved to), and a
+	// click dispatched on an ancestor never reaches a listener bound to one of
+	// its descendants — the click simply does nothing. That is the standard shape
+	// of an icon button: <div class="wrapper"><div @click><svg><use/></svg></div>
+	// </div>, where only the outer wrapper gets an index.
+	//
+	// Any `Element` is a valid target, SVG included: the hit test at an icon's
+	// center returns the inner `<use>`, which is not an `HTMLElement`. Filtering
+	// the hit target with `instanceof HTMLElement` — or with the nodeType-only
+	// `isHTMLElement` helper — silently restores the wrapper and brings the dead
+	// click back. Shadow roots are descended into for the same reason.
+	//
 	// @note This may hit a element in the blacklist
 	// TODO: This is a temporary workaround. Should have been handled during dom extraction.
 	const doc = element.ownerDocument
 	await enablePassThrough()
-	const hitTarget = doc.elementFromPoint(x, y)
+	const hitTarget = deepestElementAt(doc, x, y)
 	await disablePassThrough()
-	const target =
-		hitTarget instanceof HTMLElement && element.contains(hitTarget) ? hitTarget : element
+
+	/** Deepest element under the click point, `element` when the point misses it. */
+	const target: Element =
+		hitTarget && hitTarget !== element && containsDeep(element, hitTarget) ? hitTarget : element
 
 	const pointerOpts = {
 		bubbles: true,
@@ -120,7 +187,21 @@ export async function clickElement(element: HTMLElement) {
 
 	// Click — activation behavior (navigation, form submit, etc.) triggers
 	// via bubbling from target up to the interactive ancestor.
-	target.click()
+	//
+	// HTML targets keep using the browser's own `click()`. SVG targets have no
+	// such method, so the event is built by hand with the real click coordinates;
+	// dispatching it on the icon still runs the activation behavior of the
+	// nearest activatable ancestor, exactly like a user click on the icon does.
+	if (canClickItself(target)) {
+		target.click()
+	} else {
+		const clickInit = { bubbles: true, cancelable: true, clientX: x, clientY: y, button: 0 }
+		target.dispatchEvent(
+			typeof PointerEvent === 'function'
+				? new PointerEvent('click', { ...clickInit, pointerType: 'mouse' })
+				: new MouseEvent('click', clickInit)
+		)
+	}
 
 	await waitFor(0.2)
 }
