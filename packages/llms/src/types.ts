@@ -105,6 +105,12 @@ export interface LLMConfig {
 	 * Use this to implement provider-specific request tweaks such as caching hints or custom flags.
 	 *
 	 * Return a new object, or mutate the input object and return undefined.
+	 *
+	 * @note It runs *after* the built-in model patches, and it is the caller's
+	 * responsibility to keep the body self-consistent. For example, re-enabling
+	 * DeepSeek thinking (`thinking: { type: 'enabled' }`) requires dropping
+	 * `tool_choice` (or setting `disableNamedToolChoice`), because DeepSeek
+	 * rejects a named tool_choice in thinking mode.
 	 */
 	transformRequestBody?: (
 		requestBody: Record<string, unknown>

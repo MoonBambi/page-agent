@@ -12,6 +12,7 @@ import type {
 
 export { InvokeError, InvokeErrorTypes }
 export type { InvokeOptions, InvokeResult, LLMClient, LLMConfig, Message, Tool }
+export { mergeLLMConfig } from './utils'
 
 /**
  * LLM module

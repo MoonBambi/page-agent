@@ -4,9 +4,30 @@
 import chalk from 'chalk'
 import * as z from 'zod/v4'
 
-import type { Tool } from './types'
+import type { LLMConfig, Tool } from './types'
 
 const debug = console.debug.bind(console, chalk.gray('[LLM]'))
+
+/**
+ * Merge overrides onto a base LLM config.
+ *
+ * Used to give auxiliary LLM work (e.g. precise-xpath generation) its own model,
+ * endpoint, key or retry budget while inheriting everything else from the agent.
+ *
+ * @note Keys explicitly set to `undefined` in `overrides` do NOT clobber the base
+ * value, so a partially-filled config object cannot silently erase a setting.
+ * @returns A new object; the base config is never mutated.
+ */
+export function mergeLLMConfig(config: LLMConfig, overrides?: Partial<LLMConfig>): LLMConfig {
+	if (!overrides) return config
+
+	const merged: LLMConfig = { ...config }
+	const target = merged as unknown as Record<string, unknown>
+	for (const [key, value] of Object.entries(overrides)) {
+		if (value !== undefined) target[key] = value
+	}
+	return merged
+}
 
 /**
  * Convert Zod schema to OpenAI tool format
@@ -54,9 +75,15 @@ export function modelPatch(body: Record<string, any>, baseURL?: string) {
 	}
 
 	if (modelName.startsWith('deepseek')) {
-		debug('Patch DeepSeek: disable thinking, remove tool_choice')
+		// DeepSeek rejects a named tool_choice while thinking is on:
+		// `400 {"error":{"message":"Thinking mode does not support this tool_choice"}}`.
+		// Thinking is disabled right here, which is what makes tool_choice legal,
+		// so it is kept: forcing the tool is what turns the structured-output
+		// contract into a guarantee instead of a likelihood.
+		// @note A `transformRequestBody` that re-enables thinking must drop
+		// `tool_choice` (or set `disableNamedToolChoice`) to stay on the happy path.
+		debug('Patch DeepSeek: disable thinking')
 		body.thinking = { type: 'disabled' }
-		delete body.tool_choice
 	}
 
 	if (modelName.startsWith('gpt')) {
