@@ -54,6 +54,104 @@ const SEMANTIC_TAGS = new Set([
  */
 const newElementsCache = new WeakMap<HTMLElement, string>()
 
+/** Form controls a `<label>` can be the click proxy of. */
+const LABELLED_CONTROL_TAGS = new Set(['input', 'select', 'textarea'])
+
+/**
+ * The control a `<label>` labels, following the association HTML defines:
+ * an explicit `for="id"` reference, or otherwise the first labelable descendant.
+ * `input type="hidden"` is not a labelable element, so it is never a match.
+ */
+function findLabelledControl(label: Element): HTMLElement | null {
+	const forId = label.getAttribute('for')
+	if (forId) {
+		const explicit = label.ownerDocument.getElementById(forId)
+		return explicit && isLabelledControl(explicit) ? explicit : null
+	}
+
+	for (const candidate of label.querySelectorAll('input, select, textarea')) {
+		if (isLabelledControl(candidate)) return candidate as HTMLElement
+	}
+
+	return null
+}
+
+function isLabelledControl(element: Element): boolean {
+	const tagName = element.tagName.toLowerCase()
+	if (!LABELLED_CONTROL_TAGS.has(tagName)) return false
+	return tagName !== 'input' || (element as HTMLInputElement).type !== 'hidden'
+}
+
+/**
+ * What the control *is* and whether it is currently on. Only attributes the
+ * dehydration already prints are read, so nothing here is invisible to the LLM.
+ */
+function readControlState(control: HTMLElement): Record<string, string> {
+	const tagName = control.tagName.toLowerCase()
+	const state: Record<string, string> = {}
+
+	if (tagName === 'input') {
+		const input = control as HTMLInputElement
+		state.type = input.type || 'text'
+		if (input.type === 'checkbox' || input.type === 'radio') {
+			state.checked = input.checked ? 'true' : 'false'
+		}
+	} else {
+		state.type = tagName
+	}
+
+	const name = control.getAttribute('name')
+	if (name) state.name = name
+
+	return state
+}
+
+/**
+ * Copy the state of controls the page hides behind their own `<label>` onto the
+ * label, so the LLM can read it.
+ *
+ * Styled checkboxes are usually a 0x0 native input next to drawn artwork
+ * (element-ui's `.el-checkbox__original` is `width:0;height:0`): the input is
+ * dropped from the tree as invisible, so it never gets an index, and the label
+ * that *is* indexed carries no state of its own — its `class="is-checked"` is
+ * not an attribute the dehydration prints. A checked and an unchecked box then
+ * look identical to the agent, which cannot answer "is it already checked?" and
+ * clicks the box to find out, toggling the very state it was told to leave
+ * alone.
+ *
+ * The state is added to the extracted tree only: the live DOM keeps exactly its
+ * own markup, so page scripts and the recorded xpaths are unaffected.
+ *
+ * @note Only the label association HTML defines is followed. A hidden control
+ * inside a non-label wrapper (antd's `<Select>` renders `<input role="combobox">`
+ * in a `<div>`) still keeps its state out of the browser state; see
+ * patches/antd.ts for that shape.
+ */
+function exposeLabelledControlState(elements: FlatDomTree): void {
+	/** Controls that already report their own state: forwarding it again only adds noise. */
+	const indexedControls = new Set<Element>()
+	for (const nodeId in elements.map) {
+		const node = elements.map[nodeId]
+		if (node.type === 'TEXT_NODE') continue
+		const ref = (node as { ref?: Element }).ref
+		if (node.isInteractive === true && ref) indexedControls.add(ref)
+	}
+
+	for (const nodeId in elements.map) {
+		const node = elements.map[nodeId] as ElementDomNode
+		if (node.tagName !== 'label' || typeof node.highlightIndex !== 'number') continue
+
+		const label = node.ref as HTMLElement | undefined
+		if (!label) continue
+
+		const control = findLabelledControl(label)
+		if (!control || indexedControls.has(control)) continue
+
+		// The label's own attributes win over the derived ones.
+		node.attributes = { ...readControlState(control), ...(node.attributes ?? {}) }
+	}
+}
+
 export function getFlatTree(config: DomConfig): FlatDomTree {
 	const viewportExpansion = resolveViewportExpansion(config.viewportExpansion)
 
@@ -106,6 +204,8 @@ export function getFlatTree(config: DomConfig): FlatDomTree {
 			}
 		}
 	}
+
+	exposeLabelledControlState(elements)
 
 	return elements
 }

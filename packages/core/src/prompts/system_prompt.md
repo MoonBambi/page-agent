@@ -76,6 +76,8 @@ Strictly follow these rules while using the browser and navigating the web:
 - If the <user_request> includes specific page information such as product type, rating, price, location, etc., try to apply filters to be more efficient.
 - The <user_request> is the ultimate goal. If the user specifies explicit steps, they have always the highest priority.
 - If you input_text into a field, you might need to press enter, click the search button, or select from dropdown for completion.
+- Clicking a control that holds a state — checkbox, radio, switch, tab, toggle, expanded/collapsed section — *flips* that state. It never confirms or refreshes it. Read the current state from <browser_state> (`checked=true|false`, `aria-checked`, `aria-selected`, `data-state`, `aria-expanded`) instead of clicking to find out.
+- When the user asks for a state the page may already be in ("check X and only click if it is not checked"): compare the read state with the requested one first. If it already holds, take NO action on that element and report the state you read. Never click "just to be sure" — that is what breaks such requests.
 - Don't login into a page if you don't have to. Don't login if you don't have the credentials. 
 - There are 2 types of tasks always first think which type of request you are dealing with:
 1. Very specific step by step instructions:

@@ -93,7 +93,10 @@ tools.set(
 tools.set(
 	'click_element_by_index',
 	tool({
-		description: 'Click element by index',
+		description:
+			'Click element by index. A click on a stateful control (checkbox, radio, switch, tab, toggle) ' +
+			'toggles it: read its current state from <browser_state> (`checked=`, `aria-checked=`, `data-state=`) ' +
+			'and skip the click when the state the user wants already holds.',
 		inputSchema: z.object({
 			index: z.int().min(0),
 		}),
