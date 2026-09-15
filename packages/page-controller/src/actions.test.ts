@@ -48,6 +48,59 @@ function iconButton(): IconButton {
 	return { wrapper, box, icon, clicks }
 }
 
+interface HoverMenu {
+	/** The element an index resolves to: an outer wrapper that owns no listener. */
+	wrapper: HTMLDivElement
+	/** The trigger, shaped like el-dropdown's `.el-dropdown-selfdefine`: it owns the listeners. */
+	trigger: HTMLDivElement
+	/** The innermost element a real pointer would land on. */
+	label: HTMLSpanElement
+	/** Elements that received `mouseenter`, in firing order. */
+	entered: string[]
+	/** Whether each element's own `mouseenter` listener saw itself as `event.target`. */
+	selfTargets: [string, boolean][]
+	/** Elements that received `mouseleave`, in firing order. */
+	left: string[]
+}
+
+/**
+ * The shape behind hover-triggered menus: the index resolves to the outer wrapper,
+ * the component binds `mouseenter`/`mouseleave` to the trigger inside it, and the
+ * innermost element under the pointer is a span inside that trigger.
+ *
+ * Both halves matter. `mouseenter` dispatched at the span alone does not bubble,
+ * so the trigger never hears the pointer and the menu never opens; and
+ * `mouseleave` dispatched at the wrapper is not watched by the trigger, so a menu
+ * that did open never closes.
+ */
+function hoverMenu(): HoverMenu {
+	const wrapper = document.createElement('div')
+	const trigger = document.createElement('div')
+	trigger.className = 'el-dropdown-selfdefine'
+	const label = document.createElement('span')
+	label.textContent = 'Resources'
+	trigger.appendChild(label)
+	wrapper.appendChild(trigger)
+	document.body.appendChild(wrapper)
+
+	const entered: string[] = []
+	const selfTargets: [string, boolean][] = []
+	const left: string[] = []
+
+	trigger.addEventListener('mouseenter', (event) => {
+		entered.push('trigger')
+		selfTargets.push(['trigger', event.target === trigger])
+	})
+	label.addEventListener('mouseenter', (event) => {
+		entered.push('label')
+		selfTargets.push(['label', event.target === label])
+	})
+	trigger.addEventListener('mouseleave', () => left.push('trigger'))
+	label.addEventListener('mouseleave', () => left.push('label'))
+
+	return { wrapper, trigger, label, entered, selfTargets, left }
+}
+
 afterEach(() => {
 	delete (document as { elementFromPoint?: unknown }).elementFromPoint
 	document.body.innerHTML = ''
@@ -105,5 +158,72 @@ describe('clickElement', () => {
 		// The reason the SVG case cannot go through `element.click()`: browsers
 		// leave `SVGElement.prototype.click` undefined, and so does happy-dom.
 		expect(typeof (icon as unknown as { click?: unknown }).click).toBe('undefined')
+	})
+})
+
+describe('hover events on a hover-triggered menu', () => {
+	it('reaches a trigger that binds mouseenter above the element under the pointer', async () => {
+		const { wrapper, label, entered } = hoverMenu()
+		stubHitTest(label)
+
+		await clickElement(wrapper)
+
+		// Pre-fix only 'label' appeared: `mouseenter` does not bubble, so a listener
+		// on the trigger above it never fired. Outermost first is this
+		// implementation's choice of an order the spec leaves unspecified.
+		expect(entered).toEqual(['trigger', 'label'])
+	})
+
+	it('gives every entered element an event whose target is that element', async () => {
+		const { wrapper, label, selfTargets } = hoverMenu()
+		stubHitTest(label)
+
+		await clickElement(wrapper)
+
+		// A single bubbling event would hand both listeners `label` as
+		// `event.target`, which is what breaks a listener comparing it against itself.
+		expect(selfTargets).toEqual([
+			['trigger', true],
+			['label', true],
+		])
+	})
+
+	it('closes the previous menu by dispatching leave back down the entered path', async () => {
+		const { wrapper, label, left } = hoverMenu()
+		stubHitTest(label)
+		await clickElement(wrapper)
+
+		const other = document.createElement('div')
+		document.body.appendChild(other)
+		stubHitTest(other)
+		await clickElement(other)
+
+		// Pre-fix `mouseleave` was dispatched at the wrapper only — the trigger was
+		// never told, so the menu it opened stayed open. Innermost first, mirroring
+		// the enter order.
+		expect(left).toEqual(['label', 'trigger'])
+	})
+
+	it('climbs out of an open shadow root to reach a trigger outside it', async () => {
+		const host = document.createElement('div')
+		document.body.appendChild(host)
+		const shadow = host.attachShadow({ mode: 'open' })
+		shadow.innerHTML = '<div><span></span></div>'
+		const inner = shadow.querySelector('span')!
+
+		const entered: string[] = []
+		host.addEventListener('mouseenter', () => entered.push('host'))
+		inner.addEventListener('mouseenter', () => entered.push('inner'))
+
+		// Browsers retarget shadow content to the host, and happy-dom implements no
+		// hit testing at all, so both halves of the descent are stubbed here. The
+		// walk back out has to go through the host, since boundary events are not
+		// composed and `parentElement` is null at the shadow root.
+		Object.defineProperty(shadow, 'elementFromPoint', { configurable: true, value: () => inner })
+		stubHitTest(host)
+
+		await clickElement(host)
+
+		expect(entered).toEqual(['host', 'inner'])
 	})
 })

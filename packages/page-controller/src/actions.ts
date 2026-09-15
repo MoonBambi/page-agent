@@ -43,15 +43,42 @@ export function getElementByIndex(
 
 let lastClickedElement: HTMLElement | null = null
 
+/**
+ * Deepest element the previous click entered, and the starting point for its
+ * `leave` events.
+ *
+ * `lastClickedElement` cannot serve as that starting point: the index usually
+ * resolves to an outer wrapper while the elements that received `enter` events
+ * sit below it. Leaving from the wrapper never reaches them, so a menu opened by
+ * hovering a trigger inside the wrapper would stay open and cover whatever the
+ * next click targets.
+ */
+let lastPointerTarget: Element | null = null
+
 function blurLastClickedElement() {
-	if (lastClickedElement) {
-		lastClickedElement.dispatchEvent(new PointerEvent('pointerout', { bubbles: true }))
-		lastClickedElement.dispatchEvent(new PointerEvent('pointerleave', { bubbles: false }))
-		lastClickedElement.dispatchEvent(new MouseEvent('mouseout', { bubbles: true }))
-		lastClickedElement.dispatchEvent(new MouseEvent('mouseleave', { bubbles: false }))
-		lastClickedElement.blur()
-		lastClickedElement = null
+	if (!lastClickedElement) return
+
+	const element = lastClickedElement
+	lastClickedElement = null
+
+	// `pointerleave`/`mouseleave` do not bubble, so this mirrors the `enter`
+	// sequence in `clickElement`: one event per element the pointer leaves,
+	// innermost first. (The relative order across ancestors is unspecified;
+	// nothing here depends on it.)
+	const left = enterChain(lastPointerTarget ?? element)
+	lastPointerTarget = null
+
+	element.dispatchEvent(new PointerEvent('pointerout', { bubbles: true }))
+	for (const el of left) {
+		el.dispatchEvent(new PointerEvent('pointerleave', { bubbles: false }))
 	}
+
+	element.dispatchEvent(new MouseEvent('mouseout', { bubbles: true }))
+	for (const el of left) {
+		el.dispatchEvent(new MouseEvent('mouseleave', { bubbles: false }))
+	}
+
+	element.blur()
 }
 
 /**
@@ -102,13 +129,52 @@ function deepestElementAt(doc: Document, x: number, y: number): Element | null {
 }
 
 /**
+ * Every element a pointer enters when it arrives at `target`, innermost first.
+ *
+ * Boundary events — `pointerenter`/`mouseenter` and their `leave` counterparts —
+ * do not bubble: a browser fires a separate event at each element the pointer
+ * crosses, with `target` set to that element. Reaching those listeners therefore
+ * takes one event per element. A single bubbling event is not a substitute: every
+ * ancestor would observe the same `target`, and a listener that compares it
+ * against itself still sees nothing.
+ *
+ * The walk leaves an open shadow root through its host explicitly, for the same
+ * reason: `parentElement` is null inside a shadow root, whose parent is a
+ * `ShadowRoot` rather than an `Element`, and boundary events are not composed, so
+ * a listener outside the shadow tree is only reachable by an event dispatched at
+ * the host. `'host' in root` rather than `instanceof ShadowRoot` because this also
+ * runs against elements owned by same-origin iframes, where a global constructor
+ * check compares against another realm's class.
+ *
+ * @private Internal method, subject to change at any time.
+ */
+function enterChain(target: Element): Element[] {
+	const chain: Element[] = []
+	let el: Element | null = target
+
+	while (el) {
+		chain.push(el)
+		const root = el.getRootNode() as ShadowRoot | Document
+		el = el.parentElement ?? ('host' in root ? root.host : null)
+	}
+
+	return chain
+}
+
+/**
  * Simulate a full click following W3C Pointer Events + UI Events spec order:
  * pointerover/enter → mouseover/enter → pointerdown → mousedown → [focus] →
  * pointerup → mouseup → click
  *
- * Events are dispatched at the innermost element under the click point (SVG
- * icons included), not at `element` itself, so listeners bound to inner
+ * Bubbling events are dispatched at the innermost element under the click point
+ * (SVG icons included), not at `element` itself, so listeners bound to inner
  * elements fire exactly like they do for a real user click.
+ *
+ * That rule covers the bubbling events only. The `enter`/`leave` pair does not
+ * bubble and is dispatched once per element on the pointer's path instead — see
+ * `enterChain`. Dispatching it at the innermost element alone silently keeps a
+ * hover-triggered menu on an ancestor (el-dropdown and every other hover menu)
+ * from ever opening, because the event never reaches the element listening for it.
  *
  * @private Internal method, subject to change at any time.
  */
@@ -157,6 +223,8 @@ export async function clickElement(element: HTMLElement) {
 	const target: Element =
 		hitTarget && hitTarget !== element && containsDeep(element, hitTarget) ? hitTarget : element
 
+	lastPointerTarget = target
+
 	const pointerOpts = {
 		bubbles: true,
 		cancelable: true,
@@ -166,11 +234,24 @@ export async function clickElement(element: HTMLElement) {
 	}
 	const mouseOpts = { bubbles: true, cancelable: true, clientX: x, clientY: y, button: 0 }
 
-	// Hover — pointer events first, then mouse events (spec order)
+	// Hover — pointer events first, then mouse events (spec order).
+	//
+	// `pointerover`/`mouseover` bubble, so one dispatch at the innermost element
+	// reaches every ancestor. The `enter` pair does not, and a real pointer
+	// entering an element also enters each of its ancestors on the way in, so
+	// every element on the path gets its own event, outermost first. (The relative
+	// order across ancestors is unspecified; nothing here depends on it.)
+	const entered = enterChain(target).reverse()
+
 	target.dispatchEvent(new PointerEvent('pointerover', pointerOpts))
-	target.dispatchEvent(new PointerEvent('pointerenter', { ...pointerOpts, bubbles: false }))
+	for (const el of entered) {
+		el.dispatchEvent(new PointerEvent('pointerenter', { ...pointerOpts, bubbles: false }))
+	}
+
 	target.dispatchEvent(new MouseEvent('mouseover', mouseOpts))
-	target.dispatchEvent(new MouseEvent('mouseenter', { ...mouseOpts, bubbles: false }))
+	for (const el of entered) {
+		el.dispatchEvent(new MouseEvent('mouseenter', { ...mouseOpts, bubbles: false }))
+	}
 
 	// Press
 	target.dispatchEvent(new PointerEvent('pointerdown', pointerOpts))
